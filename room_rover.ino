@@ -1,536 +1,361 @@
+/*
+ * Room Rover
+ * -----------
+ * Small autonomous rover with:
+ *   - an IR distance sensor used to detect obstacles,
+ *   - two DC motors sharing a single PWM speed line,
+ *   - a servo that sweeps the IR sensor left/right to "look around",
+ *   - a 4-digit, 7-segment multiplexed display showing the sensor
+ *     reading (in volts).
+ *
+ * Display wiring:
+ *   PIN_SEG_ADDR_A/B/C   - 3-bit address fed into a demultiplexer that
+ *                          selects which segment (a..g, or the dot) is
+ *                          currently being driven.
+ *   PIN_DIGIT_1..4       - enable line for each of the 4 digit positions.
+ *                          The segment selected above is only visible on
+ *                          digit positions where the enable line is HIGH.
+ *
+ * The display is refreshed by scanning through the 7 segments (plus the
+ * decimal point) and, for every segment, enabling only the digit
+ * positions whose current value needs that segment lit. This has to be
+ * repeated continuously (see loop()) to avoid visible flicker.
+ */
 
 #include <Servo.h>
 
-Servo myservo;  // create servo object to control a servo
+// ---------------------------------------------------------------------
+// Pin configuration
+// ---------------------------------------------------------------------
+const uint8_t PIN_IR_SENSOR   = A0; // analog input - IR distance sensor
+const uint8_t PIN_MOTOR_LEFT  = 2;  // digital output - left motor direction
+const uint8_t PIN_MOTOR_RIGHT = 4;  // digital output - right motor direction
+const uint8_t PIN_MOTOR_SPEED = 3;  // PWM output - shared motor speed
+const uint8_t PIN_SERVO       = 5;  // PWM output - IR sensor sweep servo
 
-int analog_pin_IR = 0; // analog read IR detevtor 
-int digital_pin_motor_L = 2; // output pin for motor LEFT
-int digital_pin_motor_R = 4; // output pin for motor RIGHT
-int digital_pin_motor_S = 3; // PWM for motor (speed)
-int digital_pin_servo = 5; // serwo output pin 
+const uint8_t PIN_SEG_ADDR_A = 13; // segment-select address, bit A
+const uint8_t PIN_SEG_ADDR_B = 12; // segment-select address, bit B
+const uint8_t PIN_SEG_ADDR_C = 11; // segment-select address, bit C
+const uint8_t PIN_DIGIT_1    = 10; // digit position 1 (hundreds) enable
+const uint8_t PIN_DIGIT_2    = 9;  // digit position 2 (tens) enable
+const uint8_t PIN_DIGIT_3    = 8;  // digit position 3 (units) enable
+const uint8_t PIN_DIGIT_4    = 7;  // digit position 4 (tenths) enable
 
-int Pin_A=13;   // led pin for screen multiplekser A
-int Pin_B=12;   // led pin for screen multiplekser B
-int Pin_C=11;   // led pin for screen multiplekser C
-int Seg_1=10;   // segment no 1 output
-int Seg_2=9;    // segment no 2 output
-int Seg_3=8;    // segment no 3 output
-int Seg_4=7;    // segment no 4 output
+const uint8_t DIGIT_ENABLE_PIN[4] = { PIN_DIGIT_1, PIN_DIGIT_2, PIN_DIGIT_3, PIN_DIGIT_4 };
 
-int led_time=2;                     // delay for particular led 
+// ---------------------------------------------------------------------
+// Display timing / behaviour constants
+// ---------------------------------------------------------------------
+const uint8_t SEGMENT_REFRESH_MS = 2;  // how long each segment stays lit while scanning
+const uint8_t DISPLAY_REFRESH_PASSES = 10; // number of full scans per loop() iteration
+const uint8_t BLANK_DIGIT = 11;   // sentinel value meaning "no digit displayed here"
+const uint8_t DECIMAL_POINT_DIGIT_POS = 2; // dot is always shown after the units digit (0-based index)
 
-int a []={0, 0, 1};                 // tablice diod wyswietlacza multiplekser ABC
-int b []={1, 1, 1};
-int c []={1, 0, 0};
-int d []={1, 1, 0};
-int e []={1, 0, 1};
-int f []={0, 1, 1};
-int g []={0, 1, 0};
-int DP []={0, 0, 0};
+// 3-bit address sent to the segment demultiplexer, one row per segment a..g.
+const uint8_t SEGMENT_ADDRESS[7][3] = {
+  { 0, 0, 1 }, // a
+  { 1, 1, 1 }, // b
+  { 1, 0, 0 }, // c
+  { 1, 1, 0 }, // d
+  { 1, 0, 1 }, // e
+  { 0, 1, 1 }, // f
+  { 0, 1, 0 }, // g
+};
+const uint8_t DECIMAL_POINT_ADDRESS[3] = { 0, 0, 0 };
 
+// Standard 7-segment truth table: for each digit 0-9, which segments (a..g) are lit.
+const bool SEGMENT_LIT_FOR_DIGIT[10][7] = {
+  /*        a  b  c  d  e  f  g */
+  /* 0 */ { 1, 1, 1, 1, 1, 1, 0 },
+  /* 1 */ { 0, 1, 1, 0, 0, 0, 0 },
+  /* 2 */ { 1, 1, 0, 1, 1, 0, 1 },
+  /* 3 */ { 1, 1, 1, 1, 0, 0, 1 },
+  /* 4 */ { 0, 1, 1, 0, 0, 1, 1 },
+  /* 5 */ { 1, 0, 1, 1, 0, 1, 1 },
+  /* 6 */ { 1, 0, 1, 1, 1, 1, 1 },
+  /* 7 */ { 1, 1, 1, 0, 0, 0, 0 },
+  /* 8 */ { 1, 1, 1, 1, 1, 1, 1 },
+  /* 9 */ { 1, 1, 1, 1, 0, 1, 1 },
+};
 
-void wyswietlacz(float liczba){       //program for screen
-    String count = (String)liczba
+// ---------------------------------------------------------------------
+// Motor / servo behaviour constants
+// ---------------------------------------------------------------------
+const uint8_t MOTOR_SPEED_FULL = 255;
+const uint8_t MOTOR_SPEED_SLOW = 150;
+const uint8_t MOTOR_SPEED_OFF  = 0;
 
-    
-    int i=0, j=0, k=0, l=0;
-    float m=1;
-    
-      while (m >=0){              //hundrets - program for screen
-      m = liczba - i*100;
-      i++;
-      }
-      
-    i=i-2;
-    m=liczba-i*100;
-  
-      while (m >=0){              //tens - program for screen
-      m=liczba-i*100-j*10;
-      j++;
-      }
-      
-    j=j-2;
-    m=liczba-i*100-j*10; 
-   
-      while (m >=0){                //units - program for screen
-      m=liczba-i*100-j*10-k*1;
-      k++;
-      }
-      
-    k=k-2;
-    m=liczba-i*100-j*10-k*1;
-  
-      while (m >=-0.05){               //
-      m=liczba-i*100-j*10-k*1-l*0.1;
-      l++;
-      }
-      
-    l=l-2;
-  
-  if ((i==0) && (j!=0) && (k==0) && (l!=0)){          //special cases, we dont want zeros before (for example 001.9) - program for screen
-    i=11;
-  }
-  if ((i==0) && (j!=0) && (k!=0) && (l!=0)){
-    i=11;
-  }
-  if ((i==0) && (j==0) && (k!=0) && (l!=0)){
-    i=11;
-    j=11;
-  }
-   if ((i==0) && (j!=0) && (k!=0) && (l==0)){
-    i=11;
-  }
-  if ((i==0) && (j==0) && (k!=0) && (l==0)){
-    i=11;
-    j=11;
-  }
-  if ((i==0) && (j!=0) && (k==0) && (l==0)){
-    i=11;
-  }
-   if ((i==0) && (j==0) && (k==0) && (l!=0)){
-    i=11;
-    j=11;
-  }
-  if (l==10){
-    l=9;
+const uint8_t SERVO_CENTER = 90;
+const uint8_t SERVO_RIGHT  = 120;
+const uint8_t SERVO_LEFT   = 60;
+
+const uint16_t SERVO_MOVE_DELAY_MS = 1000;
+const uint16_t MOTOR_STEP_DELAY_MS = 1000;
+
+const float VOLTAGE_LOW_THRESHOLD  = 0.0;
+const float VOLTAGE_HIGH_THRESHOLD = 1.0;
+const float ADC_TO_VOLTS_DIVISOR   = 204.6; // converts analogRead() counts to volts
+
+Servo trackerServo; // controls the servo sweeping the IR sensor
+
+// ---------------------------------------------------------------------
+// Display driver
+// ---------------------------------------------------------------------
+
+// Drives a single segment: sets the segment address lines, then enables
+// every digit position that needs this segment lit for its current value.
+void driveSegment(uint8_t segmentIndex, const uint8_t address[3], const int digits[4]) {
+  digitalWrite(PIN_SEG_ADDR_A, address[0]);
+  digitalWrite(PIN_SEG_ADDR_B, address[1]);
+  digitalWrite(PIN_SEG_ADDR_C, address[2]);
+
+  for (uint8_t pos = 0; pos < 4; pos++) {
+    int digit = digits[pos];
+    if (digit >= 0 && digit <= 9 && SEGMENT_LIT_FOR_DIGIT[digit][segmentIndex]) {
+      digitalWrite(DIGIT_ENABLE_PIN[pos], HIGH);
+    }
   }
 
-  swiecenie (i, j, k, l);
+  delay(SEGMENT_REFRESH_MS);
 
+  for (uint8_t pos = 0; pos < 4; pos++) {
+    digitalWrite(DIGIT_ENABLE_PIN[pos], LOW);
+  }
 }
 
-   void swiecenie (int x, int y, int w, int z){
+// The decimal point is not tied to a digit value - it is always shown at
+// a fixed position (after the units digit).
+void driveDecimalPoint() {
+  digitalWrite(PIN_SEG_ADDR_A, DECIMAL_POINT_ADDRESS[0]);
+  digitalWrite(PIN_SEG_ADDR_B, DECIMAL_POINT_ADDRESS[1]);
+  digitalWrite(PIN_SEG_ADDR_C, DECIMAL_POINT_ADDRESS[2]);
 
-      digitalWrite(Seg_1, 0);          //segments - program for screen 
-      digitalWrite(Seg_2, 0);
-      digitalWrite(Seg_3, 0);
-      digitalWrite(Seg_4, 0);
-
-    aAa (x,y,w,z);
-    bBb (x,y,w,z);
-    cCc (x,y,w,z);
-    dDd (x,y,w,z);
-    eEe (x,y,w,z);
-    fFf (x,y,w,z);
-    gGg (x,y,w,z);
-    dot ();                             //dot in third segment - program for screen
+  digitalWrite(DIGIT_ENABLE_PIN[DECIMAL_POINT_DIGIT_POS], HIGH);
+  delay(SEGMENT_REFRESH_MS);
+  digitalWrite(DIGIT_ENABLE_PIN[DECIMAL_POINT_DIGIT_POS], LOW);
 }
 
+// One full refresh pass: scans through all 7 segments plus the dot.
+void displayDigits(int hundreds, int tens, int units, int tenths) {
+  for (uint8_t pos = 0; pos < 4; pos++) {
+    digitalWrite(DIGIT_ENABLE_PIN[pos], LOW);
+  }
 
- void aAa (int x,int y,int w,int z){    // program for screen A's parts
-
-  digitalWrite(Pin_A, a[0]);
-  digitalWrite(Pin_B, a[1]);
-  digitalWrite(Pin_C, a[2]);
-  
-  if ((x==0)||(x==2)||(x==3)||(x==5)||(x==6)||(x==7)||(x==8)||(x==9)){
-  digitalWrite(Seg_1, 1);
+  int digits[4] = { hundreds, tens, units, tenths };
+  for (uint8_t segment = 0; segment < 7; segment++) {
+    driveSegment(segment, SEGMENT_ADDRESS[segment], digits);
   }
-  if ((y==0)||(y==2)||(y==3)||(y==5)||(y==6)||(y==7)||(y==8)||(y==9)){
-  digitalWrite(Seg_2, 1);
-  }
-  if ((w==0)||(w==2)||(w==3)||(w==5)||(w==6)||(w==7)||(w==8)||(w==9)){
-  digitalWrite(Seg_3, 1);
-  }
-  if ((z==0)||(z==2)||(z==3)||(z==5)||(z==6)||(z==7)||(z==8)||(z==9)){
-  digitalWrite(Seg_4, 1);
-  }
-  delay(led_time);
-  digitalWrite(Seg_1, 0);          //segments - program for screen
-  digitalWrite(Seg_2, 0);
-  digitalWrite(Seg_3, 0);
-  digitalWrite(Seg_4, 0);
-}
- void bBb (int x,int y,int w,int z){  // program for screen B's parts
-
-  digitalWrite(Pin_A, b[0]);
-  digitalWrite(Pin_B, b[1]);
-  digitalWrite(Pin_C, b[2]);
-  
-  if ((x==0)||(x==1)||(x==2)||(x==3)||(x==4)||(x==7)||(x==8)||(x==9)){
-  digitalWrite(Seg_1, 1);
-  }
-  if ((y==0)||(y==1)||(y==2)||(y==3)||(y==4)||(y==7)||(y==8)||(y==9)){
-  digitalWrite(Seg_2, 1);
-  }
-  if ((w==0)||(w==1)||(w==2)||(w==3)||(w==4)||(w==7)||(w==8)||(w==9)){
-  digitalWrite(Seg_3, 1);
-  }
-  if ((z==0)||(z==1)||(z==2)||(z==3)||(z==4)||(z==7)||(z==8)||(z==9)){
-  digitalWrite(Seg_4, 1);
-  }
-  delay(led_time);
-  digitalWrite(Seg_1, 0);       
-  digitalWrite(Seg_2, 0);
-  digitalWrite(Seg_3, 0);
-  digitalWrite(Seg_4, 0);
-}
-void cCc (int x,int y,int w,int z){     // program for screen C's parts
-
-  digitalWrite(Pin_A, c[0]);
-  digitalWrite(Pin_B, c[1]);
-  digitalWrite(Pin_C, c[2]);
-  
-  if ((x==0)||(x==1)||(x==3)||(x==4)||(x==5)||(x==6)||(x==7)||(x==8)||(x==9)){
-  digitalWrite(Seg_1, 1);
-  }
-  if ((y==0)||(y==1)||(y==3)||(y==4)||(y==5)||(y==6)||(y==7)||(y==8)||(y==9)){
-  digitalWrite(Seg_2, 1);
-  }
-  if ((w==0)||(w==1)||(w==3)||(w==4)||(w==5)||(w==6)||(w==7)||(w==8)||(w==9)){
-  digitalWrite(Seg_3, 1);
-  }
-  if ((z==0)||(z==1)||(z==3)||(z==4)||(z==5)||(z==6)||(z==7)||(z==8)||(z==9)){
-  digitalWrite(Seg_4, 1);
-  }
-  delay(led_time);
-  digitalWrite(Seg_1, 0);         
-  digitalWrite(Seg_2, 0);
-  digitalWrite(Seg_3, 0);
-  digitalWrite(Seg_4, 0);
+  driveDecimalPoint();
 }
 
-void dDd (int x,int y,int w,int z){   // program for screen D's parts
+// Suppresses leading zeros (e.g. shows "1.9" instead of "001.9"), except
+// when the whole number is exactly zero - then it is shown as "0.0".
+void suppressLeadingZeros(int &hundreds, int &tens, int units, int tenths) {
+  bool isExactlyZero = (tens == 0 && units == 0 && tenths == 0);
 
-  digitalWrite(Pin_A, d[0]);
-  digitalWrite(Pin_B, d[1]);
-  digitalWrite(Pin_C, d[2]);
-  
-  if ((x==0)||(x==2)||(x==3)||(x==5)||(x==6)||(x==8)||(x==9)){
-  digitalWrite(Seg_1, 1);
+  if (hundreds == 0 && !isExactlyZero) {
+    hundreds = BLANK_DIGIT;
+    if (tens == 0) {
+      tens = BLANK_DIGIT;
+    }
   }
-  if ((y==0)||(y==2)||(y==3)||(y==5)||(y==6)||(y==8)||(y==9)){
-  digitalWrite(Seg_2, 1);
-  }
-  if ((w==0)||(w==2)||(w==3)||(w==5)||(w==6)||(w==8)||(w==9)){
-  digitalWrite(Seg_3, 1);
-  }
-  if ((z==0)||(z==2)||(z==3)||(z==5)||(z==6)||(z==8)||(z==9)){
-  digitalWrite(Seg_4, 1);
-  }
-  delay(led_time);
-  digitalWrite(Seg_1, 0);       
-  digitalWrite(Seg_2, 0);
-  digitalWrite(Seg_3, 0);
-  digitalWrite(Seg_4, 0);
-}
-void eEe (int x,int y,int w,int z){   // program for screen E's parts
-
-  digitalWrite(Pin_A, e[0]);
-  digitalWrite(Pin_B, e[1]);
-  digitalWrite(Pin_C, e[2]);
-  
-  if ((x==0)||(x==2)||(x==6)||(x==8)){
-  digitalWrite(Seg_1, 1);
-  }
-  if ((y==0)||(y==2)||(y==6)||(y==8)){
-  digitalWrite(Seg_2, 1);
-  }
-  if ((w==0)||(w==2)||(w==6)||(w==8)){
-  digitalWrite(Seg_3, 1);
-  }
-  if ((z==0)||(z==2)||(z==6)||(z==8)){
-  digitalWrite(Seg_4, 1);
-  }
-  delay(led_time);
-  digitalWrite(Seg_1, 0);         
-  digitalWrite(Seg_2, 0);
-  digitalWrite(Seg_3, 0);
-  digitalWrite(Seg_4, 0);
-}
-void fFf (int x,int y,int w,int z){     // program for screen F's parts
-
-  digitalWrite(Pin_A, f[0]);
-  digitalWrite(Pin_B, f[1]);
-  digitalWrite(Pin_C, f[2]);
-  
-  if ((x==0)||(x==4)||(x==5)||(x==6)||(x==8)||(x==9)){
-  digitalWrite(Seg_1, 1);
-  }
-  if ((y==0)||(y==4)||(y==5)||(y==6)||(y==8)||(y==9)){
-  digitalWrite(Seg_2, 1);
-  }
-  if ((w==0)||(w==4)||(w==5)||(w==6)||(w==8)||(w==9)){
-  digitalWrite(Seg_3, 1);
-  }
-  if ((z==0)||(z==4)||(z==5)||(z==6)||(z==8)||(z==9)){
-  digitalWrite(Seg_4, 1);
-  }
-  delay(led_time);
-  digitalWrite(Seg_1, 0);        
-  digitalWrite(Seg_2, 0);
-  digitalWrite(Seg_3, 0);
-  digitalWrite(Seg_4, 0);
-}
-void gGg (int x,int y,int w,int z){     // program for screen G's parts
-
-  digitalWrite(Pin_A, g[0]);
-  digitalWrite(Pin_B, g[1]);
-  digitalWrite(Pin_C, g[2]);
-  
-  if ((x==2)||(x==3)||(x==4)||(x==5)||(x==6)||(x==8)||(x==9)){
-  digitalWrite(Seg_1, 1);
-  }
-  if ((y==2)||(y==3)||(y==4)||(y==5)||(y==6)||(y==8)||(y==9)){
-  digitalWrite(Seg_2, 1);
-  }
-  if ((w==2)||(w==3)||(w==4)||(w==5)||(w==6)||(w==8)||(w==9)){
-  digitalWrite(Seg_3, 1);
-  }
-  if ((z==2)||(z==3)||(z==4)||(z==5)||(z==6)||(z==8)||(z==9)){
-  digitalWrite(Seg_4, 1);
-  }
-  delay(led_time);
-  digitalWrite(Seg_1, 0);         
-  digitalWrite(Seg_2, 0);
-  digitalWrite(Seg_3, 0);
-  digitalWrite(Seg_4, 0);
-}
-void dot (){                        // program for screen dot's parts
-  digitalWrite(Pin_A, DP[0]);
-  digitalWrite(Pin_B, DP[1]);
-  digitalWrite(Pin_C, DP[2]);
-  digitalWrite(Seg_3, 1);
-  delay(led_time);
-  digitalWrite(Seg_3, 0);
 }
 
-void right (int x){                                     //turning right screen - program for screen
-
-  for (int k=1; k<=x; k++){ 
-  digitalWrite(Pin_A, g[0]);
-  digitalWrite(Pin_B, g[1]);
-  digitalWrite(Pin_C, g[2]);
-                                                             
-  digitalWrite(Seg_1, 1); 
-  delay (400);          
-  digitalWrite(Seg_2, 1);
-  delay (100); 
-  digitalWrite(Seg_3, 1);
-  delay (100); 
-  digitalWrite(Seg_4, 1);
-  delay (100);
-
-  digitalWrite(Seg_1, 0);           
-  digitalWrite(Seg_2, 0);
-  digitalWrite(Seg_3, 0);
-  digitalWrite(Seg_4, 0);
+// Splits a non-negative floating point value (0.0 - 999.9) into its
+// hundreds/tens/units/tenths digits and refreshes the display once.
+void updateDisplay(float value) {
+  if (value < 0) {
+    value = 0; // the display cannot show negative numbers
   }
-}
-void left (int x){                                     //turning left screen - program for screen
 
-  for (int k=1; k<=x; k++){ 
-  digitalWrite(Pin_A, g[0]);
-  digitalWrite(Pin_B, g[1]);
-  digitalWrite(Pin_C, g[2]);
-                                                             
-  digitalWrite(Seg_4, 1); 
-  delay (400);          
-  digitalWrite(Seg_3, 1);
-  delay (100); 
-  digitalWrite(Seg_2, 1);
-  delay (100); 
-  digitalWrite(Seg_1, 1);
-  delay (100);
+  int scaledTenths = (int)(value * 10.0f + 0.5f); // round to the nearest 0.1
 
-  digitalWrite(Seg_1, 0);           
-  digitalWrite(Seg_2, 0);
-  digitalWrite(Seg_3, 0);
-  digitalWrite(Seg_4, 0);
-  }
-}
- 
+  int hundreds = (scaledTenths / 1000) % 10;
+  int tens     = (scaledTenths / 100) % 10;
+  int units    = (scaledTenths / 10) % 10;
+  int tenths   = scaledTenths % 10;
 
+  suppressLeadingZeros(hundreds, tens, units, tenths);
 
-void servo (int val){                        // program for servo
- myservo.write(val);                  // sets the servo position according to the scaled value
- delay(15);  
+  displayDigits(hundreds, tens, units, tenths);
 }
-void motor_L(int pwm, int on_off){                                   //program for motor which one is moving LEFT
- digitalWrite (digital_pin_motor_L, on_off);
- analogWrite(digital_pin_motor_S, pwm); 
-}
-void motor_R(int pwm, int on_off){                                   //program for motor which one is moving RIGHT
- digitalWrite (digital_pin_motor_R, on_off);
- analogWrite(digital_pin_motor_S, pwm); 
-}
-void turning_right (){                                                 //program for turning RIGHT
-  
-  int delay_for_servo = 1000;
-  int servo_right = 120;
-  int servo_left = 60;
- right(3);
-// Serial.println("turning right");
- servo(90);
- delay (delay_for_servo);
- motor_R(255,1);
- delay (1000);
- motor_R(0,0);
- servo(servo_right);
- delay(delay_for_servo);
- motor_L(255,1);
- delay (1000);
- servo(90);
- delay(delay_for_servo);
-}
-void turning_left (){                                                 //program for turning LEFT
-  
-  int delay_for_servo = 1000;
-  int servo_right = 120;
-  int servo_left = 60;
- left(3); 
-// Serial.println("turning left");
- servo(90);
- delay (delay_for_servo);
- motor_R(255,1);
- delay (1000);
- motor_R(0,0);
- servo(servo_left);
- delay(delay_for_servo);
- motor_L(255,1);
- delay (1000);
- servo(90);
- delay(delay_for_servo);
-}
-void look (){                                                        //program for looking around 
-  int delay_for_servo = 1000;
-  int servo_right = 120;
-  int servo_left = 60;
 
-  
-   delay (1000);
-//   Serial.println("backwords");
-   motor_R(255,1);
-   delay (1000);
-   motor_R(0,0);
-//   Serial.println("stop");
-   servo(servo_right);
-//   Serial.println("right");
-   delay(delay_for_servo);
-   float reading1 = analogRead(analog_pin_IR);
-//   Serial.println(reading1);
-   servo(servo_left);
-//   Serial.println("left");
-   delay(delay_for_servo);
-   float reading2 = analogRead(analog_pin_IR);
-//   Serial.println(reading2);
-        if (reading1>reading2){
-            turning_right();
-            
-       }
-        else if (reading1<reading2){
-            turning_left();
-      } 
+// Simple animation used to show a "turning" direction indicator, sweeping
+// segment g across all 4 digit positions.
+void showTurnAnimation(uint8_t repetitions, bool toTheRight) {
+  const uint8_t order[4] = { 0, 1, 2, 3 };
+
+  for (uint8_t rep = 0; rep < repetitions; rep++) {
+    digitalWrite(PIN_SEG_ADDR_A, SEGMENT_ADDRESS[6][0]); // segment 'g'
+    digitalWrite(PIN_SEG_ADDR_B, SEGMENT_ADDRESS[6][1]);
+    digitalWrite(PIN_SEG_ADDR_C, SEGMENT_ADDRESS[6][2]);
+
+    for (uint8_t step = 0; step < 4; step++) {
+      uint8_t pos = toTheRight ? order[step] : order[3 - step];
+      digitalWrite(DIGIT_ENABLE_PIN[pos], HIGH);
+      delay(step == 0 ? 400 : 100);
     }
 
-void test (){                                 //program for motor, servo and screen test 
-//  Serial.println("testing");                  //motor and servo testing 
-/*  servo(90);
-  delay(1000);
-  servo(160);
-  delay(2000);
-  servo(20);
-  delay(2000);
-  servo(90);
-  delay(2000);
-  motor_R(255,1);
-  delay(500);
-  motor_R(0,0);
-  delay(500);
-  motor_L(255,1);
-  delay(500);
-  motor_L(0,0);
-  delay(500);*/
+    for (uint8_t pos = 0; pos < 4; pos++) {
+      digitalWrite(DIGIT_ENABLE_PIN[pos], LOW);
+    }
+  }
+}
 
-  int tDelay=150;                               //screen testing 
-  digitalWrite(Seg_4, 1);   
-  digitalWrite(Seg_3, 1); 
-  digitalWrite(Seg_2, 1);
-  digitalWrite(Seg_1, 1);
-  
-  digitalWrite(Pin_A, a[0]);
-  digitalWrite(Pin_B, a[1]);
-  digitalWrite(Pin_C, a[2]);
-  delay(tDelay);
-  digitalWrite(Pin_A, b[0]);
-  digitalWrite(Pin_B, b[1]);
-  digitalWrite(Pin_C, b[2]);
-  delay(tDelay);
-  digitalWrite(Pin_A, c[0]);
-  digitalWrite(Pin_B, c[1]);
-  digitalWrite(Pin_C, c[2]);
-  delay(tDelay);
-  digitalWrite(Pin_A, d[0]);
-  digitalWrite(Pin_B, d[1]);
-  digitalWrite(Pin_C, d[2]);
-  delay(tDelay);
-  digitalWrite(Pin_A, e[0]);
-  digitalWrite(Pin_B, e[1]);
-  digitalWrite(Pin_C, e[2]);
-  delay(tDelay);
-  digitalWrite(Pin_A, f[0]);
-  digitalWrite(Pin_B, f[1]);
-  digitalWrite(Pin_C, f[2]);
-  delay(tDelay);
-  digitalWrite(Pin_A, g[0]);
-  digitalWrite(Pin_B, g[1]);
-  digitalWrite(Pin_C, g[2]);
-  delay(tDelay);
-  digitalWrite(Pin_A, DP[0]);
-  digitalWrite(Pin_B, DP[1]);
-  digitalWrite(Pin_C, DP[2]);
-  delay(tDelay+800);
-                                                             
-  digitalWrite(Seg_1, 0);           
-  digitalWrite(Seg_2, 0);
-  digitalWrite(Seg_3, 0);
-  digitalWrite(Seg_4, 0);
+// Lights every segment/digit/dot in sequence once, used as a power-on
+// self-test for the display.
+void runDisplaySelfTest() {
+  const uint8_t stepDelayMs = 150;
+
+  for (uint8_t pos = 0; pos < 4; pos++) {
+    digitalWrite(DIGIT_ENABLE_PIN[pos], HIGH);
+  }
+
+  for (uint8_t segment = 0; segment < 7; segment++) {
+    digitalWrite(PIN_SEG_ADDR_A, SEGMENT_ADDRESS[segment][0]);
+    digitalWrite(PIN_SEG_ADDR_B, SEGMENT_ADDRESS[segment][1]);
+    digitalWrite(PIN_SEG_ADDR_C, SEGMENT_ADDRESS[segment][2]);
+    delay(stepDelayMs);
+  }
+
+  digitalWrite(PIN_SEG_ADDR_A, DECIMAL_POINT_ADDRESS[0]);
+  digitalWrite(PIN_SEG_ADDR_B, DECIMAL_POINT_ADDRESS[1]);
+  digitalWrite(PIN_SEG_ADDR_C, DECIMAL_POINT_ADDRESS[2]);
+  delay(stepDelayMs + 800);
+
+  for (uint8_t pos = 0; pos < 4; pos++) {
+    digitalWrite(DIGIT_ENABLE_PIN[pos], LOW);
+  }
 }
-int metoda () {
-  
+
+// ---------------------------------------------------------------------
+// Motor / servo driver
+// ---------------------------------------------------------------------
+
+void setServoAngle(uint8_t angle) {
+  trackerServo.write(angle);
+  delay(15); // give the servo time to reach the position
 }
+
+void setMotorLeft(uint8_t speed, bool enabled) {
+  digitalWrite(PIN_MOTOR_LEFT, enabled ? HIGH : LOW);
+  analogWrite(PIN_MOTOR_SPEED, speed);
+}
+
+void setMotorRight(uint8_t speed, bool enabled) {
+  digitalWrite(PIN_MOTOR_RIGHT, enabled ? HIGH : LOW);
+  analogWrite(PIN_MOTOR_SPEED, speed);
+}
+
+void turnRight() {
+  Serial.println("turning right");
+  showTurnAnimation(3, true);
+
+  setServoAngle(SERVO_CENTER);
+  delay(SERVO_MOVE_DELAY_MS);
+  setMotorRight(MOTOR_SPEED_FULL, true);
+  delay(MOTOR_STEP_DELAY_MS);
+  setMotorRight(MOTOR_SPEED_OFF, false);
+
+  setServoAngle(SERVO_RIGHT);
+  delay(SERVO_MOVE_DELAY_MS);
+  setMotorLeft(MOTOR_SPEED_FULL, true);
+  delay(MOTOR_STEP_DELAY_MS);
+
+  setServoAngle(SERVO_CENTER);
+  delay(SERVO_MOVE_DELAY_MS);
+}
+
+void turnLeft() {
+  Serial.println("turning left");
+  showTurnAnimation(3, false);
+
+  setServoAngle(SERVO_CENTER);
+  delay(SERVO_MOVE_DELAY_MS);
+  setMotorRight(MOTOR_SPEED_FULL, true);
+  delay(MOTOR_STEP_DELAY_MS);
+  setMotorRight(MOTOR_SPEED_OFF, false);
+
+  setServoAngle(SERVO_LEFT);
+  delay(SERVO_MOVE_DELAY_MS);
+  setMotorLeft(MOTOR_SPEED_FULL, true);
+  delay(MOTOR_STEP_DELAY_MS);
+
+  setServoAngle(SERVO_CENTER);
+  delay(SERVO_MOVE_DELAY_MS);
+}
+
+// Sweeps the IR sensor left and right, compares the two readings and
+// turns towards the direction with more free space (higher reading).
+void lookAround() {
+  delay(1000);
+
+  Serial.println("backwards");
+  setMotorRight(MOTOR_SPEED_FULL, true);
+  delay(MOTOR_STEP_DELAY_MS);
+  setMotorRight(MOTOR_SPEED_OFF, false);
+
+  Serial.println("looking right");
+  setServoAngle(SERVO_RIGHT);
+  delay(SERVO_MOVE_DELAY_MS);
+  float readingRight = analogRead(PIN_IR_SENSOR);
+  Serial.println(readingRight);
+
+  Serial.println("looking left");
+  setServoAngle(SERVO_LEFT);
+  delay(SERVO_MOVE_DELAY_MS);
+  float readingLeft = analogRead(PIN_IR_SENSOR);
+  Serial.println(readingLeft);
+
+  if (readingRight > readingLeft) {
+    turnRight();
+  } else if (readingRight < readingLeft) {
+    turnLeft();
+  }
+}
+
+// ---------------------------------------------------------------------
+// Arduino entry points
+// ---------------------------------------------------------------------
 
 void setup() {
-//  Serial.begin(9600);
-  myservo.attach(digital_pin_servo);      // attaches the servo on pin 9 to the servo object
-  pinMode ( digital_pin_motor_L, OUTPUT); // attaches the motor_L on pin 10
-  pinMode ( digital_pin_motor_R, OUTPUT); // attaches the motor_R on pin 12
-  pinMode ( digital_pin_motor_S, OUTPUT); // attaches the motor(PWM) on pin 11
-  pinMode (Pin_A, OUTPUT);                //pin for screen
-  pinMode (Pin_B, OUTPUT);
-  pinMode (Pin_C, OUTPUT);
-  pinMode (Seg_1, OUTPUT);
-  pinMode (Seg_2, OUTPUT);
-  pinMode (Seg_3, OUTPUT);
-  pinMode (Seg_4, OUTPUT);
-  test ();
-  
+  Serial.begin(9600);
+
+  trackerServo.attach(PIN_SERVO);
+
+  pinMode(PIN_MOTOR_LEFT, OUTPUT);
+  pinMode(PIN_MOTOR_RIGHT, OUTPUT);
+  pinMode(PIN_MOTOR_SPEED, OUTPUT);
+
+  pinMode(PIN_SEG_ADDR_A, OUTPUT);
+  pinMode(PIN_SEG_ADDR_B, OUTPUT);
+  pinMode(PIN_SEG_ADDR_C, OUTPUT);
+  pinMode(PIN_DIGIT_1, OUTPUT);
+  pinMode(PIN_DIGIT_2, OUTPUT);
+  pinMode(PIN_DIGIT_3, OUTPUT);
+  pinMode(PIN_DIGIT_4, OUTPUT);
+
+  runDisplaySelfTest();
 }
 
 void loop() {
-  
-int reading = analogRead(analog_pin_IR);      //turn on IR detector
-float vol = reading / 204.6;                  //concversion read to Volts
-//Serial.println (vol);
+  int reading = analogRead(PIN_IR_SENSOR);
+  float volts = reading / ADC_TO_VOLTS_DIVISOR;
+  Serial.println(volts);
 
-// float i =reading ;                       // number from 0.0 to 999.9
-  for (int T=0; T<10; T++){         //turn on program for led screen (time is equal to number of loops 
-  wyswietlacz(vol);                     //program for led screen
+  for (uint8_t pass = 0; pass < DISPLAY_REFRESH_PASSES; pass++) {
+    updateDisplay(volts);
   }
 
-if (vol>=1){
-//  Serial.println("POWER");
-  motor_L(255,1);
-}
-
-  else if (vol<=1 && vol>=0){
-//  Serial.println("I'm slowing down");
-  motor_L(150,1);
-}
-  else if (vol<=0){
-  Serial.println("I'm looking around ");
-  motor_L(0,0);
-  look();
-}
-
+  if (volts >= VOLTAGE_HIGH_THRESHOLD) {
+    Serial.println("POWER");
+    setMotorLeft(MOTOR_SPEED_FULL, true);
+  } else if (volts >= VOLTAGE_LOW_THRESHOLD) {
+    Serial.println("I'm slowing down");
+    setMotorLeft(MOTOR_SPEED_SLOW, true);
+  } else {
+    Serial.println("I'm looking around");
+    setMotorLeft(MOTOR_SPEED_OFF, false);
+    lookAround();
+  }
 }
